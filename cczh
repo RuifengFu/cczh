@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+"""cczh — Claude Code 显示层翻译的安装与管理工具。
+
+用法:
+  cczh install      一次性安装（钩子 + CLAUDE.md 约定 + 后台服务 + 自检）
+  cczh uninstall    撤销全部改动
+  cczh status       服务与翻译统计
+  cczh start|stop|restart
+  cczh test         不调 API 的本地自检 + 一次真实翻译
+  cczh zh [存档]    把历史会话（默认当前目录最近一次）补翻成中文 Markdown
+  cczh logs         查看服务日志
+  cczh serve        前台运行（调试用）
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+# ---------------------------------------------------------------- 路径与常量
+
+SELF   = os.path.realpath(__file__)
+ROOT   = os.path.dirname(SELF)
+LABEL  = "com.cczh.translator"
+PORT   = int(os.environ.get("CCZH_PORT", "8795"))
+URL    = f"http://127.0.0.1:{PORT}/hooks/message-display"
+ASK_URL = f"http://127.0.0.1:{PORT}/hooks/ask-question"
+UID_   = str(os.getuid())
+
+SETTINGS   = os.path.expanduser("~/.claude/settings.json")
+CLAUDE_MD  = os.path.expanduser("~/.claude/CLAUDE.md")
+ENV_FILE   = os.path.expanduser("~/.config/cczh/env")
+PLIST      = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+LOG_OUT    = os.path.expanduser("~/Library/Logs/cczh.log")
+LOG_ERR    = os.path.expanduser("~/Library/Logs/cczh.err.log")
+BIN_LINK   = os.path.expanduser("~/.local/bin/cczh")
+
+CLAUDE_BLOCK = """\
+<!-- cczh:begin — 显示层翻译约定，cczh uninstall 可移除 -->
+Always write your responses in English, including your thinking. The user reads your
+output through an automatic English->Chinese display translator, and English output
+minimizes token usage. Exceptions:
+- /btw side questions display in an overlay that bypasses the translator,
+  so answer /btw questions in Chinese directly.
+- When the user explicitly asks for Chinese output (for example writing or
+  translating Chinese text), produce Chinese for that part.
+Code, identifiers, commands, and file contents are never affected.
+<!-- cczh:end -->
+"""
+
+# ---------------------------------------------------------------- 小工具
+
+def say(msg=""):
+    print(msg)
+
+def run(cmd, check=True, quiet=False):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0 and not quiet:
+        say(f"  命令失败: {' '.join(cmd)}\n{r.stderr.strip()}")
+    return r
+
+def http_json(path, timeout=3, data=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PORT}{path}",
+        data=json.dumps(data).encode() if data is not None else None,
+        headers={"Content-Type": "application/json"},
+        method="POST" if data is not None else "GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+def daemon_up():
+    try:
+        return http_json("/health")["ok"] is True
+    except Exception:
+        return False
+
+# ---------------------------------------------------------------- 安装 / 卸载
+
+def find_api_key():
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if key:
+        return key
+    zshrc = os.path.expanduser("~/.zshrc")
+    if os.path.exists(zshrc):                        # 只解析 export 行，不打印内容
+        for line in open(zshrc, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"export\s+DEEPSEEK_API_KEY=(.+)$", line)
+            if m:
+                return m.group(1).strip().strip('"').strip("'")
+    return _env_file_get("DEEPSEEK_API_KEY")
+
+def _env_file_get(key):
+    if os.path.exists(ENV_FILE):
+        for line in open(ENV_FILE, encoding="utf-8"):
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip()
+    return ""
+
+def _env_file_write(pairs):
+    """保留注释行，更新/追加给定键值。"""
+    keep = {}
+    lines = []
+    if os.path.exists(ENV_FILE):
+        for line in open(ENV_FILE, encoding="utf-8"):
+            if "=" in line and not line.strip().startswith("#"):
+                k = line.split("=", 1)[0].strip()
+                if k not in pairs:
+                    keep[k] = line.split("=", 1)[1].strip()
+            else:
+                lines.append(line.rstrip("\n"))
+    os.makedirs(os.path.dirname(ENV_FILE), exist_ok=True)
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        for k, v in pairs.items():
+            if v:
+                f.write(f"{k}={v}\n")
+        for k, v in keep.items():
+            f.write(f"{k}={v}\n")
+    os.chmod(ENV_FILE, 0o600)
+
+def backend(name):
+    if name == "deepseek":
+        key = find_api_key()
+        if not key:
+            say("✗ 没找到 DEEPSEEK_API_KEY（zshrc / 环境变量 / 配置文件都没有）")
+            sys.exit(1)
+        _env_file_write({"CCZH_API_KEY": key, "CCZH_BASE_URL": "https://api.deepseek.com",
+                         "CCZH_MODEL": "deepseek-chat"})
+        say("✓ 后端切换为 DeepSeek (deepseek-chat)")
+        if os.path.exists(PLIST):
+            restart()
+            time.sleep(0.5)
+            selftest(live=True)
+        return
+    say("用法: cczh backend deepseek（其他 OpenAI 兼容后端直接编辑 ~/.config/cczh/env）")
+
+def install_env():
+    key = find_api_key()
+    if not key:
+        say("✗ 没找到 DEEPSEEK_API_KEY（环境变量、~/.zshrc、~/.config/cczh/env 都没有）")
+        say(f"  或手动写入: echo 'DEEPSEEK_API_KEY=sk-xxx' > {ENV_FILE}")
+        return False
+    _env_file_write({"DEEPSEEK_API_KEY": key})
+    say(f"✓ API key 已写入 {ENV_FILE}")
+    return True
+
+def install_settings():
+    if os.path.exists(SETTINGS):
+        with open(SETTINGS, encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = {}
+    hooks = data.setdefault("hooks", {})
+    # 我们的钩子按 URL 幂等注册；别人已有的钩子（同事件不同 URL）绝不动
+    ours = {
+        "MessageDisplay": {"hooks": [{"type": "http", "url": URL,
+                                      "timeout": 20}]},
+        "PreToolUse": {"matcher": "AskUserQuestion",
+                       "hooks": [{"type": "http", "url": ASK_URL,
+                                  "timeout": 20}]},
+    }
+    for event, entry in ours.items():
+        existing = hooks.get(event, [])
+        same = [e for e in existing
+                if any(h.get("url") in (URL, ASK_URL) for h in e.get("hooks", []))]
+        if same:
+            existing[existing.index(same[0])] = entry
+        else:
+            existing.append(entry)
+        hooks[event] = existing
+    backup = SETTINGS + ".bak-cczh"
+    if not os.path.exists(backup):
+        shutil.copy2(SETTINGS, backup)
+    with open(SETTINGS, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    say(f"✓ 钩子已写入 {SETTINGS}（MessageDisplay + AskQuestion；备份: settings.json.bak-cczh）")
+
+def install_claude_md():
+    block, marker = CLAUDE_BLOCK, "<!-- cczh:begin"
+    content = ""
+    if os.path.exists(CLAUDE_MD):
+        content = open(CLAUDE_MD, encoding="utf-8").read()
+    if marker in content:                            # 幂等：替换旧块
+        content = re.sub(r"<!-- cczh:begin.*?<!-- cczh:end -->\n?",
+                         block, content, flags=re.S)
+        new = content
+    else:
+        new = content.rstrip("\n") + ("\n\n" if content else "") + block
+        if not new.endswith("\n"):
+            new += "\n"
+    with open(CLAUDE_MD, "w", encoding="utf-8") as f:
+        f.write(new)
+    say(f"✓ 英文回复约定已写入 {CLAUDE_MD}")
+
+def install_plist():
+    os.makedirs(os.path.dirname(LOG_OUT), exist_ok=True)
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{sys.executable}</string>
+    <string>{ROOT}/server.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>{ROOT}</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{LOG_OUT}</string>
+  <key>StandardErrorPath</key><string>{LOG_ERR}</string>
+</dict>
+</plist>
+"""
+    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+    with open(PLIST, "w", encoding="utf-8") as f:
+        f.write(plist)
+    say(f"✓ 后台服务配置已写入 {PLIST}")
+
+def load_daemon():
+    run(["launchctl", "bootout", f"gui/{UID_}", PLIST], check=False, quiet=True)
+    r = run(["launchctl", "bootstrap", f"gui/{UID_}", PLIST])
+    if r.returncode != 0:
+        return False
+    for _ in range(30):                              # 等健康检查通过
+        if daemon_up():
+            say(f"✓ 服务已启动: 127.0.0.1:{PORT}")
+            return True
+        time.sleep(0.2)
+    say("✗ 服务启动后健康检查未通过，查看日志: cczh logs")
+    return False
+
+def install():
+    say("== cczh install ==")
+    if not install_env():
+        sys.exit(1)
+    install_settings()
+    install_claude_md()
+    install_plist()
+    if BIN_LINK != SELF and not os.path.exists(BIN_LINK):
+        os.makedirs(os.path.dirname(BIN_LINK), exist_ok=True)
+        os.symlink(SELF, BIN_LINK)
+        say(f"✓ 命令已链接: {BIN_LINK}")
+    if not load_daemon():
+        sys.exit(1)
+    say("")
+    selftest(live=True)
+
+def uninstall():
+    say("== cczh uninstall ==")
+    run(["launchctl", "bootout", f"gui/{UID_}", PLIST], check=False, quiet=True)
+    for p in (PLIST, ENV_FILE):
+        if os.path.exists(p):
+            os.remove(p)
+            say(f"✓ 已删除 {p}")
+    if os.path.exists(SETTINGS):
+        data = json.load(open(SETTINGS, encoding="utf-8"))
+        hooks = data.get("hooks", {})
+        changed = False
+        for event in ("MessageDisplay", "PreToolUse"):
+            entries = hooks.get(event, [])
+            keep = [e for e in entries
+                    if not any(h.get("url") in (URL, ASK_URL)
+                               for h in e.get("hooks", []))]
+            if len(keep) != len(entries):
+                changed = True
+                if keep:
+                    hooks[event] = keep
+                else:
+                    hooks.pop(event, None)
+        if changed:
+            if not hooks:
+                data.pop("hooks", None)
+            with open(SETTINGS, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            say(f"✓ 已从 {SETTINGS} 移除钩子（只删 cczh 的，其他钩子保留）")
+    if os.path.exists(CLAUDE_MD):
+        content = open(CLAUDE_MD, encoding="utf-8").read()
+        new = re.sub(r"\n*<!-- cczh:begin.*?<!-- cczh:end -->\n?", "", content,
+                     flags=re.S)
+        if new != content:
+            with open(CLAUDE_MD, "w", encoding="utf-8") as f:
+                f.write(new)
+            say(f"✓ 已从 {CLAUDE_MD} 移除英文约定")
+    if os.path.islink(BIN_LINK):
+        os.remove(BIN_LINK)
+        say(f"✓ 已删除 {BIN_LINK}")
+    say("完成。正在进行的 Claude Code 会话需重启后完全生效。")
+
+# ---------------------------------------------------------------- 服务控制
+
+def start():
+    if daemon_up():
+        say("已在运行中")
+        return
+    if not os.path.exists(PLIST):
+        say("未安装，请先: cczh install")
+        sys.exit(1)
+    load_daemon()
+
+def stop():
+    run(["launchctl", "bootout", f"gui/{UID_}", PLIST], check=False)
+    say("已停止")
+
+def restart():
+    run(["launchctl", "kickstart", "-k", f"gui/{UID_}/{LABEL}"], check=False)
+    for _ in range(20):
+        if daemon_up():
+            say("已重启")
+            return
+        time.sleep(0.2)
+    say("重启后健康检查未通过，查看: cczh logs")
+
+def status():
+    loaded = run(["launchctl", "print", f"gui/{UID_}/{LABEL}"],
+                 check=False, quiet=True).returncode == 0
+    say(f"launchd: {'已加载' if loaded else '未加载'}   端口 {PORT}: "
+        f"{'在线' if daemon_up() else '离线'}")
+    if daemon_up():
+        s = http_json("/stats")
+        n = max(s["translated"], 1)
+        say(f"模型: {http_json('/health').get('model')}   "
+            f"运行: {int(time.time() - s['started']) // 60} 分钟")
+        say(f"批次: {s['batches']}  翻译: {s['translated']}  "
+            f"放行: {s['passthrough']}  错误: {s['errors']}  "
+            f"平均耗时: {s['total_ms'] // n} ms")
+        if s["last_error"]:
+            say(f"最近错误: {s['last_error']}")
+
+# ---------------------------------------------------------------- 测试
+
+SAMPLES = [
+    {   # 普通英文 → 应翻译
+        "message_id": "test-prose", "index": 0, "final": False,
+        "delta": "Here is the plan:\n1. Read the config file\n2. Fix the timeout bug\n",
+    },
+    {   # 代码块 → 应原样放行
+        "message_id": "test-code", "index": 0, "final": False,
+        "delta": "The fix looks like:\n```python\ndef add(a, b):\n    return a + b\n```\nDone.\n",
+    },
+    {   # 已是中文 → 应放行
+        "message_id": "test-zh", "index": 0, "final": False,
+        "delta": "这个方案已经生效了，无需再改。\n",
+    },
+]
+
+ASK_SAMPLE = {
+    "tool_name": "AskUserQuestion",
+    "tool_input": {"questions": [{
+        "question": "Which package manager should we use for this project?",
+        "header": "Pkg manager",
+        "options": [
+            {"label": "pnpm (Recommended)", "description": "Fast, disk-efficient"},
+            {"label": "npm", "description": "The default, no extra setup"},
+        ],
+    }]},
+}
+
+def selftest(live=False):
+    ok = True
+    say("── 本地自检（不调 API）──")
+    sys.path.insert(0, ROOT)
+    import server
+
+    items, fence = server.classify(SAMPLES[0]["delta"], False)
+    kinds = [k for k, _ in items]
+    ok &= kinds == ["prose", "prose", "prose"]
+    say(f"  分类(英文): {'✓' if kinds == ['prose'] * 3 else '✗'} {kinds}")
+
+    items, fence = server.classify(SAMPLES[1]["delta"], False)
+    kinds = [k for k, _ in items]
+    expect = ["prose", "fence", "code", "code", "fence", "prose"]
+    ok &= kinds == expect
+    say(f"  分类(代码): {'✓' if kinds == expect else '✗'} {kinds}")
+
+    ok &= server.looks_chinese(SAMPLES[2]["delta"])
+    ok &= not server.looks_chinese(SAMPLES[0]["delta"])
+    say(f"  中文检测: {'✓' if ok else '✗'}")
+
+    if not live:
+        say("提示: 完整测试请先 cczh install，再 cczh test")
+        return ok
+
+    say("── 真实翻译（经守护进程）──")
+    if not daemon_up():
+        say("✗ 守护进程不在线")
+        return False
+    for s in SAMPLES:
+        try:
+            r = http_json("/hooks/message-display", timeout=25, data=s)
+            out = r.get("hookSpecificOutput", {}).get("displayContent", "(无)")
+            say(f"  输入: {s['delta'][:40]!r}...")
+            say(f"  输出: {out!r}\n")
+        except Exception as e:
+            say(f"  ✗ {e}")
+            ok = False
+    try:
+        r = http_json("/hooks/ask-question", timeout=25, data=ASK_SAMPLE)
+        q = r.get("hookSpecificOutput", {}).get("updatedInput", {}) \
+             .get("questions", [{}])[0]
+        say(f"  AskQuestion: {q.get('question')!r}")
+        say(f"  选项: {q.get('options')!r}\n")
+    except Exception as e:
+        say(f"  ✗ ask: {e}")
+        ok = False
+    say("全部通过 ✓" if ok else "存在失败项 ✗")
+    return ok
+
+def logs():
+    for p in (LOG_ERR, LOG_OUT):
+        if os.path.exists(p):
+            say(f"──── {p} ────")
+            r = run(["tail", "-n", "30", p], check=False)
+            if r.stdout:
+                say(r.stdout.rstrip())
+
+# ---------------------------------------------------------------- 会话补翻
+
+def zh_cmd(args):
+    """cczh zh [存档.jsonl] [--all] — 把历史会话翻成中文 Markdown。
+
+    缺省取当前目录最近一次 Claude Code 会话，最近 40 轮；--all 翻全部。
+    原存档不动，输出写在旁边: <存档名>.zh.md"""
+    target, all_flag = None, "--all" in args
+    for a in args:
+        if not a.startswith("--"):
+            target = a
+    if not target:
+        proj = re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(os.getcwd()))
+        proj_dir = os.path.expanduser(f"~/.claude/projects/{proj}")
+        files = (sorted([os.path.join(proj_dir, f) for f in os.listdir(proj_dir)
+                         if f.endswith(".jsonl")],
+                        key=os.path.getmtime, reverse=True)
+                 if os.path.isdir(proj_dir) else [])
+        if not files:
+            say(f"✗ 在 {proj_dir} 没找到会话存档；也可指定路径: cczh zh <file.jsonl>")
+            sys.exit(1)
+        target = files[0]
+        say(f"选定最近会话: {os.path.basename(target)}")
+
+    turns = []
+    for line in open(target, encoding="utf-8"):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("isSidechain") or obj.get("isMeta"):
+            continue
+        typ = obj.get("type")
+        if typ not in ("user", "assistant"):
+            continue
+        content = (obj.get("message") or {}).get("content")
+        texts, tools = [], []
+        if isinstance(content, str):
+            if content.strip():
+                texts.append(content)
+        elif isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and (b.get("text") or "").strip():
+                    texts.append(b["text"])
+                elif b.get("type") == "tool_use":
+                    tools.append(b.get("name", "tool"))
+        if texts or tools:
+            turns.append({"role": typ, "texts": texts, "tools": tools})
+
+    if not turns:
+        say("✗ 存档里没有可翻译的对话")
+        sys.exit(1)
+    if not all_flag:
+        turns = turns[-40:]
+
+    sys.path.insert(0, ROOT)
+    import server
+    from concurrent.futures import ThreadPoolExecutor
+
+    say(f"共 {len(turns)} 轮，翻译中…")
+    jobs = []                                        # (turn_idx, text_idx, 需要翻译?)
+    for i, t in enumerate(turns):
+        for j, text in enumerate(t["texts"]):
+            jobs.append((i, j, t["role"] == "assistant"))
+
+    def tr(job):
+        i, j, need = job
+        if not need:
+            return
+        st = {"en_tail": "", "zh_tail": ""}
+        turn = turns[i]
+        turn["texts"][j] = server.translate_text(turn["texts"][j], st)
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(tr, jobs))
+
+    md = [f"# 会话中文版 · {os.path.basename(target)}",
+          f"> 源: {target} · {len(turns)} 轮 · 生成于 {time.strftime('%Y-%m-%d %H:%M')}", ""]
+    for t in turns:
+        if t["role"] == "user":
+            md += ["## 🧑 你", ""]
+        else:
+            md += ["## 🤖 Claude", ""]
+            if t["tools"]:
+                md += [f"*🔧 {'、'.join(t['tools'])}*", ""]
+        md += [x.rstrip() for x in t["texts"]] + ["", "---", ""]
+    out_path = target[: -len(".jsonl")] + ".zh.md"
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md))
+    say(f"✓ 已生成: {out_path}")
+
+# ---------------------------------------------------------------- 入口
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "install":
+        install()
+    elif cmd == "uninstall":
+        uninstall()
+    elif cmd == "start":
+        start()
+    elif cmd == "stop":
+        stop()
+    elif cmd == "restart":
+        restart()
+    elif cmd == "status":
+        status()
+    elif cmd == "backend":
+        backend(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif cmd == "test":
+        sys.exit(0 if selftest(live=daemon_up()) else 1)
+    elif cmd == "zh":
+        zh_cmd(sys.argv[2:])
+    elif cmd == "logs":
+        logs()
+    elif cmd == "serve":
+        os.execv(sys.executable, [sys.executable, os.path.join(ROOT, "server.py")])
+    else:
+        say(__doc__)
+
+if __name__ == "__main__":
+    main()
