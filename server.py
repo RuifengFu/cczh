@@ -160,12 +160,21 @@ class DeepSeek:
     def _acquire(self):
         self._sem.acquire()
         with self._pool_lock:
-            return self._pool.pop() if self._pool else self._new_conn()
+            if self._pool:
+                conn, idle_since = self._pool.pop()
+                if time.time() - idle_since > 30:   # 空闲连接可能已被服务端断开，不赌
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                else:
+                    return conn
+            return self._new_conn()
 
     def _release(self, conn, healthy):
         if healthy:
             with self._pool_lock:
-                self._pool.append(conn)
+                self._pool.append((conn, time.time()))
         else:
             try:
                 conn.close()
@@ -195,7 +204,7 @@ class DeepSeek:
         body = json.dumps(payload).encode("utf-8")
 
         last_err = None
-        for attempt in (0, 1):                       # 网络/5xx 重试一次
+        for attempt in (0, 1, 2):                    # 连接类错误最多试 3 次（防闲置竞态）
             if deadline is not None and time.time() > deadline:
                 raise RuntimeError(f"超时预算用尽: {last_err or ''}")
             conn = self._acquire()
