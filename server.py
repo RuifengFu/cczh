@@ -24,30 +24,48 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------- 配置
 
-def _load_env_file():
-    path = os.path.expanduser("~/.config/cczh/env")
-    cfg = {}
-    if os.path.exists(path):
+def _load_config():
+    """读取配置。优先级: 环境变量 > config.json > 旧版 env 文件。"""
+    conf = {}
+    legacy = os.path.expanduser("~/.config/cczh/env")
+    if os.path.exists(legacy):                       # 旧版 KEY=VALUE 文件
         try:
-            for line in open(path, encoding="utf-8"):
+            for line in open(legacy, encoding="utf-8"):
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip().strip('"').strip("'")
+                conf[k.strip()] = v.strip().strip('"').strip("'")
         except OSError:
             pass
-    return cfg
+    path = os.path.expanduser("~/.config/cczh/config.json")
+    if os.path.exists(path):
+        try:
+            data = json.load(open(path, encoding="utf-8"))
+            if isinstance(data, dict):
+                conf.update({k: v for k, v in data.items() if v not in (None, "")})
+        except (OSError, ValueError):
+            pass
+    return conf
 
-_ENV_FILE = _load_env_file()
+_CONF = _load_config()
 
-def cfg(key, default=None):
-    return os.environ.get(key) or _ENV_FILE.get(key) or default
+def _pick(*names, default=None):
+    """按序取配置：环境变量 > 旧版长名 > json 短名。"""
+    for n in names:
+        if os.environ.get(n):
+            return os.environ[n]
+        for k in (n, n.removeprefix("CCZH_").lower()):
+            v = _CONF.get(k)
+            if v not in (None, ""):
+                return v
+    return default
 
-API_KEY  = cfg("CCZH_API_KEY") or cfg("DEEPSEEK_API_KEY", "")
-BASE_URL = cfg("CCZH_BASE_URL", "https://api.deepseek.com")
-MODEL    = cfg("CCZH_MODEL", "deepseek-chat")
-PORT        = int(cfg("CCZH_PORT", "8795"))
+API_KEY  = _pick("CCZH_API_KEY", "DEEPSEEK_API_KEY", default="")
+BASE_URL = _pick("CCZH_BASE_URL", default="https://api.deepseek.com")
+MODEL    = _pick("CCZH_MODEL", default="deepseek-flash")
+EFFORT   = _pick("CCZH_EFFORT", default="")          # flash 档位: low/high/max
+PORT     = int(_pick("CCZH_PORT", default="8795"))
 TAIL_CHARS  = 280    # 送给译者的上下文长度
 CHUNK_CHARS = 2000   # 超长批次按行边界切块
 MAX_STATES  = 300    # 最多记住多少条消息的状态
@@ -168,6 +186,8 @@ class DeepSeek:
                 {"role": "user", "content": user_text},
             ],
         }
+        if EFFORT:                                   # 翻译用低档位：更快更省
+            payload["effort"] = EFFORT
         body = json.dumps(payload).encode("utf-8")
 
         last_err = None

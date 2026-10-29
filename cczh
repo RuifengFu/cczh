@@ -36,7 +36,8 @@ UID_   = str(os.getuid()) if hasattr(os, "getuid") else ""
 
 SETTINGS   = os.path.expanduser("~/.claude/settings.json")
 CLAUDE_MD  = os.path.expanduser("~/.claude/CLAUDE.md")
-ENV_FILE   = os.path.expanduser("~/.config/cczh/env")
+ENV_FILE   = os.path.expanduser("~/.config/cczh/env")      # 旧版，自动迁移
+CONFIG_FILE = os.path.expanduser("~/.config/cczh/config.json")
 PID_FILE   = os.path.expanduser("~/.config/cczh/cczh.pid")
 
 if IS_WIN:
@@ -104,6 +105,8 @@ def find_api_key():
     key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if key:
         return key
+    if _config_read().get("api_key"):
+        return _config_read()["api_key"]
     for rc in ("~/.zshrc", "~/.bashrc"):             # 只解析 export 行，不打印内容
         zshrc = os.path.expanduser(rc)
         if not os.path.exists(zshrc):
@@ -124,26 +127,40 @@ def _env_file_get(key):
                 return line.split("=", 1)[1].strip()
     return ""
 
-def _env_file_write(pairs):
-    """保留注释行，更新/追加给定键值。"""
-    keep = {}
-    lines = []
-    if os.path.exists(ENV_FILE):
-        for line in open(ENV_FILE, encoding="utf-8"):
-            if "=" in line and not line.strip().startswith("#"):
-                k = line.split("=", 1)[0].strip()
-                if k not in pairs:
-                    keep[k] = line.split("=", 1)[1].strip()
-            else:
-                lines.append(line.rstrip("\n"))
-    os.makedirs(os.path.dirname(ENV_FILE), exist_ok=True)
-    with open(ENV_FILE, "w", encoding="utf-8") as f:
-        for k, v in pairs.items():
-            if v:
-                f.write(f"{k}={v}\n")
-        for k, v in keep.items():
-            f.write(f"{k}={v}\n")
-    os.chmod(ENV_FILE, 0o600)
+def _config_read():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            return json.load(open(CONFIG_FILE, encoding="utf-8"))
+        except ValueError:
+            return {}
+    return {}
+
+def _config_write(pairs):
+    data = _config_read()
+    data.update({k: v for k, v in pairs.items() if v})
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.chmod(CONFIG_FILE, 0o600)
+
+def _migrate_env():
+    """旧版 env 文件一次性迁移为 config.json。"""
+    if not os.path.exists(ENV_FILE) or os.path.exists(CONFIG_FILE):
+        return
+    mapping = {"CCZH_API_KEY": "api_key", "CCZH_BASE_URL": "base_url",
+               "CCZH_MODEL": "model", "CCZH_PORT": "port",
+               "DEEPSEEK_API_KEY": "api_key"}
+    data = _config_read()
+    for line in open(ENV_FILE, encoding="utf-8"):
+        if "=" not in line or line.strip().startswith("#"):
+            continue
+        k, v = line.strip().split("=", 1)
+        if k in mapping and mapping[k] not in data:
+            data[mapping[k]] = v.strip().strip('"').strip("'")
+    _config_write(data)
+    os.remove(ENV_FILE)
+    say(f"✓ 旧配置已迁移并升级: {CONFIG_FILE}")
 
 def backend(name):
     if name == "deepseek":
@@ -151,24 +168,29 @@ def backend(name):
         if not key:
             say("✗ 没找到 DEEPSEEK_API_KEY（zshrc / 环境变量 / 配置文件都没有）")
             sys.exit(1)
-        _env_file_write({"CCZH_API_KEY": key, "CCZH_BASE_URL": "https://api.deepseek.com",
-                         "CCZH_MODEL": "deepseek-chat"})
-        say("✓ 后端切换为 DeepSeek (deepseek-chat)")
-        if os.path.exists(ENV_FILE):
+        _config_write({"api_key": key, "base_url": "https://api.deepseek.com",
+                       "model": "deepseek-flash", "effort": "low"})
+        say("✓ 后端切换为 DeepSeek (deepseek-flash, effort=low)")
+        if os.path.exists(CONFIG_FILE):
             restart()
             time.sleep(0.5)
             selftest(live=True)
         return
-    say("用法: cczh backend deepseek（其他 OpenAI 兼容后端直接编辑 ~/.config/cczh/env）")
+    say("用法: cczh backend deepseek（其他 OpenAI 兼容后端直接编辑 ~/.config/cczh/config.json）")
 
-def install_env():
-    key = find_api_key()
+def install_config():
+    _migrate_env()
+    data = _config_read()
+    key = data.get("api_key") or find_api_key()
     if not key:
-        say("✗ 没找到 DEEPSEEK_API_KEY（环境变量、~/.zshrc、~/.config/cczh/env 都没有）")
-        say(f"  或手动写入: echo 'DEEPSEEK_API_KEY=sk-xxx' > {ENV_FILE}")
+        say("✗ 没找到 DEEPSEEK_API_KEY（环境变量、~/.zshrc、~/.bashrc 都没有）")
+        say(f'  手动创建 {CONFIG_FILE}: {{"api_key": "sk-..."}}')
         return False
-    _env_file_write({"DEEPSEEK_API_KEY": key})
-    say(f"✓ API key 已写入 {ENV_FILE}")
+    _config_write({"api_key": key,
+                   "base_url": data.get("base_url") or "https://api.deepseek.com",
+                   "model": data.get("model") or "deepseek-flash",
+                   "effort": data.get("effort") or "low"})
+    say(f"✓ 配置已写入 {CONFIG_FILE}")
     return True
 
 def install_settings():
@@ -331,7 +353,7 @@ def _pid_alive():
 
 def install():
     say("== cczh install ==")
-    if not install_env():
+    if not install_config():
         sys.exit(1)
     install_settings()
     install_claude_md()
@@ -372,7 +394,7 @@ def uninstall():
                 os.kill(pid, 15)
             except OSError:
                 pass
-    for p in ((UNIT,) if UNIT else ()) + (ENV_FILE, PID_FILE):
+    for p in ((UNIT,) if UNIT else ()) + (CONFIG_FILE, ENV_FILE, PID_FILE):
         if os.path.exists(p):
             os.remove(p)
             say(f"✓ 已删除 {p}")
@@ -428,7 +450,7 @@ def start():
     if daemon_up():
         say("已在运行中")
         return
-    if not os.path.exists(ENV_FILE):
+    if not os.path.exists(CONFIG_FILE):
         say("未安装，请先: cczh install")
         sys.exit(1)
     load_daemon()

@@ -56,7 +56,7 @@ git clone https://github.com/RuifengFu/cczh ~/project/cczh && cd ~/project/cczh
 
 `install` 做的事（全部可被 `uninstall` 撤销）：
 
-1. 找 API key（环境变量 `$DEEPSEEK_API_KEY` → `~/.zshrc` 的 export 行），写入 `~/.config/cczh/env`（权限 600）
+1. 找 API key（`~/.config/cczh/config.json` → 环境变量 `$DEEPSEEK_API_KEY` → `~/.zshrc`/`~/.bashrc` 的 export 行），生成配置文件（权限 600）
 2. `~/.claude/settings.json` 合并写入两个 HTTP 钩子（改动前自动备份为 `settings.json.bak-cczh`；**已有钩子绝不动**）
 3. `~/.claude/CLAUDE.md` 追加英文回复约定块（带 `cczh:begin/end` 标记）
 4. 写 launchd 配置 `~/Library/LaunchAgents/com.cczh.translator.plist` 并启动
@@ -67,16 +67,29 @@ git clone https://github.com/RuifengFu/cczh ~/project/cczh && cd ~/project/cczh
 
 ## 配置
 
-`~/.config/cczh/env`（KEY=VALUE 格式）：
+配置文件：`~/.config/cczh/config.json`（权限 600，`cczh install` 自动生成；故意不放项目目录里——公开仓库绝不能进密钥）。
 
-| 变量 | 说明 | 默认 |
+```json
+{
+  "api_key": "sk-...",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-flash",
+  "effort": "low",
+  "port": 8795
+}
+```
+
+| 字段 | 含义 | 默认 |
 |---|---|---|
-| `CCZH_API_KEY` / `DEEPSEEK_API_KEY` | 翻译 API key（前者优先） | 无 |
-| `CCZH_BASE_URL` | OpenAI 兼容端点 | `https://api.deepseek.com` |
-| `CCZH_MODEL` | 翻译模型 | `deepseek-chat` |
-| `CCZH_PORT` | 本地服务端口 | `8795` |
+| `api_key` | 翻译服务的钥匙 | 无（必填） |
+| `base_url` | OpenAI 兼容端点地址 | `https://api.deepseek.com` |
+| `model` | 翻译模型 | `deepseek-flash`（快、便宜，翻译够用） |
+| `effort` | 模型档位（`low`/`high`/`max`，仅部分模型支持） | `low` |
+| `port` | 本地服务端口 | `8795` |
 
-翻译后端使用 DeepSeek。也可以在 `~/.config/cczh/env` 里手动改成任何 OpenAI 兼容端点（`CCZH_BASE_URL` + `CCZH_MODEL` + `CCZH_API_KEY`），改完 `cczh restart` 生效；切回 DeepSeek 用：
+改完执行 `cczh restart` 生效。环境变量 `CCZH_API_KEY` / `CCZH_BASE_URL` / `CCZH_MODEL` / `CCZH_PORT` 可临时覆盖（优先级最高）。旧版 `env` 键值文件会在 `cczh install` 时自动迁移成 `config.json`。
+
+切回 DeepSeek 官方默认配置（当你在 config.json 里改乱了）：
 
 ```bash
 cczh backend deepseek
@@ -170,7 +183,7 @@ cczh uninstall   # 撤销全部改动（只删自己的钩子，别人的配置�
 cczh uninstall
 ```
 
-移除：两个钩子（只删 cczh 的 URL，其他钩子保留）、CLAUDE.md 约定块、launchd 服务、`~/.config/cczh/env`、命令链接。进行中的会话重启后完全恢复原状。
+移除：两个钩子（只删 cczh 的 URL，其他钩子保留）、CLAUDE.md 约定块、后台服务、`~/.config/cczh/config.json`、命令链接。进行中的会话重启后完全恢复原状。
 
 ## FAQ
 
