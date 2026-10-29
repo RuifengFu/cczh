@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cczh — Claude Code 显示层翻译的安装与管理工具。
+"""cczh — Claude Code 显示层翻译的安装与管理工具（macOS / Linux / Windows）。
 
 用法:
   cczh install      一次性安装（钩子 + CLAUDE.md 约定 + 后台服务 + 自检）
@@ -28,15 +28,35 @@ LABEL  = "com.cczh.translator"
 PORT   = int(os.environ.get("CCZH_PORT", "8795"))
 URL    = f"http://127.0.0.1:{PORT}/hooks/message-display"
 ASK_URL = f"http://127.0.0.1:{PORT}/hooks/ask-question"
-UID_   = str(os.getuid())
+
+IS_MAC  = sys.platform == "darwin"
+IS_WIN  = sys.platform.startswith("win")
+IS_LINUX = not IS_MAC and not IS_WIN
+UID_   = str(os.getuid()) if hasattr(os, "getuid") else ""
 
 SETTINGS   = os.path.expanduser("~/.claude/settings.json")
 CLAUDE_MD  = os.path.expanduser("~/.claude/CLAUDE.md")
 ENV_FILE   = os.path.expanduser("~/.config/cczh/env")
-PLIST      = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
-LOG_OUT    = os.path.expanduser("~/Library/Logs/cczh.log")
-LOG_ERR    = os.path.expanduser("~/Library/Logs/cczh.err.log")
-BIN_LINK   = os.path.expanduser("~/.local/bin/cczh")
+PID_FILE   = os.path.expanduser("~/.config/cczh/cczh.pid")
+
+if IS_WIN:
+    LOG_DIR  = os.path.expandvars(r"%LOCALAPPDATA%\cczh")
+    LOG_OUT  = os.path.join(LOG_DIR, "cczh.log")
+    LOG_ERR  = os.path.join(LOG_DIR, "cczh.err.log")
+    BIN_LINK = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cczh.cmd")
+    UNIT     = None
+    TASK_NAME = "cczh"                              # 任务计划程序里的任务名
+elif IS_MAC:
+    LOG_OUT  = os.path.expanduser("~/Library/Logs/cczh.log")
+    LOG_ERR  = os.path.expanduser("~/Library/Logs/cczh.err.log")
+    BIN_LINK = os.path.expanduser("~/.local/bin/cczh")
+    UNIT     = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+else:                                               # Linux
+    LOG_DIR  = os.path.expanduser("~/.local/state/cczh")
+    LOG_OUT  = os.path.join(LOG_DIR, "cczh.log")
+    LOG_ERR  = os.path.join(LOG_DIR, "cczh.err.log")
+    BIN_LINK = os.path.expanduser("~/.local/bin/cczh")
+    UNIT     = os.path.expanduser("~/.config/systemd/user/cczh.service")
 
 CLAUDE_BLOCK = """\
 <!-- cczh:begin — 显示层翻译约定，cczh uninstall 可移除 -->
@@ -84,8 +104,10 @@ def find_api_key():
     key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if key:
         return key
-    zshrc = os.path.expanduser("~/.zshrc")
-    if os.path.exists(zshrc):                        # 只解析 export 行，不打印内容
+    for rc in ("~/.zshrc", "~/.bashrc"):             # 只解析 export 行，不打印内容
+        zshrc = os.path.expanduser(rc)
+        if not os.path.exists(zshrc):
+            continue
         for line in open(zshrc, encoding="utf-8"):
             line = line.strip()
             if not line or line.startswith("#"):
@@ -132,7 +154,7 @@ def backend(name):
         _env_file_write({"CCZH_API_KEY": key, "CCZH_BASE_URL": "https://api.deepseek.com",
                          "CCZH_MODEL": "deepseek-chat"})
         say("✓ 后端切换为 DeepSeek (deepseek-chat)")
-        if os.path.exists(PLIST):
+        if os.path.exists(ENV_FILE):
             restart()
             time.sleep(0.5)
             selftest(live=True)
@@ -198,9 +220,10 @@ def install_claude_md():
         f.write(new)
     say(f"✓ 英文回复约定已写入 {CLAUDE_MD}")
 
-def install_plist():
+def install_service():
     os.makedirs(os.path.dirname(LOG_OUT), exist_ok=True)
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+    if IS_MAC:
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -219,23 +242,92 @@ def install_plist():
 </dict>
 </plist>
 """
-    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
-    with open(PLIST, "w", encoding="utf-8") as f:
-        f.write(plist)
-    say(f"✓ 后台服务配置已写入 {PLIST}")
+        os.makedirs(os.path.dirname(UNIT), exist_ok=True)
+        with open(UNIT, "w", encoding="utf-8") as f:
+            f.write(plist)
+        say(f"✓ 后台服务配置已写入 {UNIT}")
+    elif IS_LINUX and shutil.which("systemctl"):
+        unit = f"""[Unit]
+Description=cczh display translator for Claude Code
+After=network-online.target
 
-def load_daemon():
-    run(["launchctl", "bootout", f"gui/{UID_}", PLIST], check=False, quiet=True)
-    r = run(["launchctl", "bootstrap", f"gui/{UID_}", PLIST])
-    if r.returncode != 0:
-        return False
-    for _ in range(30):                              # 等健康检查通过
+[Service]
+ExecStart={sys.executable} {ROOT}/server.py
+WorkingDirectory={ROOT}
+Restart=always
+StandardOutput=append:{LOG_OUT}
+StandardError=append:{LOG_ERR}
+
+[Install]
+WantedBy=default.target
+"""
+        os.makedirs(os.path.dirname(UNIT), exist_ok=True)
+        with open(UNIT, "w", encoding="utf-8") as f:
+            f.write(unit)
+        say(f"✓ systemd 用户服务已写入 {UNIT}")
+    else:
+        say("ℹ 未检测到系统服务管理器，使用手动模式（cczh start/stop）")
+        if IS_WIN:                                # 登录自启：任务计划程序
+            r = run(["schtasks", "/Create", "/TN", TASK_NAME,
+                     "/TR", f'"{sys.executable}" "{ROOT}\\server.py"',
+                     "/SC", "ONLOGON", "/F"], check=False)
+            say("✓ 已创建登录自启任务（任务计划程序: cczh）" if r.returncode == 0
+                else "⚠ 创建自启任务失败，可手动 cczh start")
+
+
+def _wait_health(timeout_s=6.0):
+    for _ in range(int(timeout_s / 0.2)):
         if daemon_up():
-            say(f"✓ 服务已启动: 127.0.0.1:{PORT}")
             return True
         time.sleep(0.2)
+    return False
+
+
+def load_daemon():
+    if IS_MAC:
+        run(["launchctl", "bootout", f"gui/{UID_}", UNIT], check=False, quiet=True)
+        r = run(["launchctl", "bootstrap", f"gui/{UID_}", UNIT])
+        if r.returncode != 0:
+            return False
+    elif IS_LINUX and shutil.which("systemctl"):
+        run(["systemctl", "--user", "daemon-reload"], check=False)
+        r = run(["systemctl", "--user", "enable", "--now", "cczh"], check=False)
+        if r.returncode != 0:
+            say("✗ systemctl 启动失败（无桌面会话时先执行: "
+                "loginctl enable-linger $USER）")
+            return False
+    else:                                          # Windows / 无 systemd 的 Linux
+        _spawn_detached()
+    if _wait_health():
+        say(f"✓ 服务已启动: 127.0.0.1:{PORT}")
+        return True
     say("✗ 服务启动后健康检查未通过，查看日志: cczh logs")
     return False
+
+
+def _spawn_detached():
+    """Windows / 手动模式：后台拉起 server.py（日志重定向到文件）。"""
+    os.makedirs(os.path.dirname(LOG_OUT), exist_ok=True)
+    out = open(LOG_OUT, "ab")
+    err = open(LOG_ERR, "ab")
+    kwargs = dict(stdout=out, stderr=err, cwd=ROOT, close_fds=True)
+    if IS_WIN:
+        kwargs["creationflags"] = 0x00000008 | 0x00000020   # DETACHED | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py")], **kwargs)
+
+
+def _pid_alive():
+    try:
+        pid = int(open(PID_FILE, encoding="utf-8").read().strip())
+        if IS_WIN:
+            r = run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                    check=False, quiet=True)
+            return str(pid) in (r.stdout or "")
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
 
 def install():
     say("== cczh install ==")
@@ -243,20 +335,44 @@ def install():
         sys.exit(1)
     install_settings()
     install_claude_md()
-    install_plist()
-    if BIN_LINK != SELF and not os.path.exists(BIN_LINK):
-        os.makedirs(os.path.dirname(BIN_LINK), exist_ok=True)
-        os.symlink(SELF, BIN_LINK)
-        say(f"✓ 命令已链接: {BIN_LINK}")
+    install_service()
+    install_bin()
     if not load_daemon():
         sys.exit(1)
     say("")
     selftest(live=True)
 
+
+def install_bin():
+    if IS_WIN:
+        os.makedirs(os.path.dirname(BIN_LINK), exist_ok=True)
+        with open(BIN_LINK, "w", encoding="utf-8") as f:
+            f.write(f'@echo off\n"{sys.executable}" "{ROOT}\\cczh" %*\n')
+        say(f"✓ 命令已安装: {BIN_LINK}")
+    elif BIN_LINK != SELF and not os.path.exists(BIN_LINK):
+        os.makedirs(os.path.dirname(BIN_LINK), exist_ok=True)
+        os.symlink(SELF, BIN_LINK)
+        say(f"✓ 命令已链接: {BIN_LINK}")
+
+
 def uninstall():
     say("== cczh uninstall ==")
-    run(["launchctl", "bootout", f"gui/{UID_}", PLIST], check=False, quiet=True)
-    for p in (PLIST, ENV_FILE):
+    if IS_MAC:
+        run(["launchctl", "bootout", f"gui/{UID_}", UNIT], check=False, quiet=True)
+    elif IS_LINUX and shutil.which("systemctl"):
+        run(["systemctl", "--user", "disable", "--now", "cczh"], check=False, quiet=True)
+        run(["systemctl", "--user", "daemon-reload"], check=False, quiet=True)
+    elif IS_WIN:
+        run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], check=False, quiet=True)
+        for pid in _pids_of_server():
+            run(["taskkill", "/PID", str(pid), "/F", "/T"], check=False, quiet=True)
+    else:
+        for pid in _pids_of_server():
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+    for p in ((UNIT,) if UNIT else ()) + (ENV_FILE, PID_FILE):
         if os.path.exists(p):
             os.remove(p)
             say(f"✓ 已删除 {p}")
@@ -290,10 +406,21 @@ def uninstall():
             with open(CLAUDE_MD, "w", encoding="utf-8") as f:
                 f.write(new)
             say(f"✓ 已从 {CLAUDE_MD} 移除英文约定")
-    if os.path.islink(BIN_LINK):
+    if os.path.exists(BIN_LINK):
         os.remove(BIN_LINK)
         say(f"✓ 已删除 {BIN_LINK}")
     say("完成。正在进行的 Claude Code 会话需重启后完全生效。")
+
+
+def _pids_of_server():
+    """手动模式下找到 server.py 的进程（按 pid 文件 + 命令行匹配兜底）。"""
+    pids = []
+    if os.path.exists(PID_FILE):
+        try:
+            pids.append(int(open(PID_FILE, encoding="utf-8").read().strip()))
+        except ValueError:
+            pass
+    return pids
 
 # ---------------------------------------------------------------- 服务控制
 
@@ -301,29 +428,56 @@ def start():
     if daemon_up():
         say("已在运行中")
         return
-    if not os.path.exists(PLIST):
+    if not os.path.exists(ENV_FILE):
         say("未安装，请先: cczh install")
         sys.exit(1)
     load_daemon()
 
+
 def stop():
-    run(["launchctl", "bootout", f"gui/{UID_}", PLIST], check=False)
+    if IS_MAC:
+        run(["launchctl", "bootout", f"gui/{UID_}", UNIT], check=False)
+    elif IS_LINUX and shutil.which("systemctl"):
+        run(["systemctl", "--user", "stop", "cczh"], check=False)
+    else:
+        for pid in _pids_of_server():
+            if IS_WIN:
+                run(["taskkill", "/PID", str(pid), "/F", "/T"], check=False)
+            else:
+                try:
+                    os.kill(pid, 15)
+                except OSError:
+                    pass
     say("已停止")
 
+
 def restart():
-    run(["launchctl", "kickstart", "-k", f"gui/{UID_}/{LABEL}"], check=False)
-    for _ in range(20):
-        if daemon_up():
-            say("已重启")
-            return
-        time.sleep(0.2)
-    say("重启后健康检查未通过，查看: cczh logs")
+    if IS_MAC:
+        run(["launchctl", "kickstart", "-k", f"gui/{UID_}/{LABEL}"], check=False)
+    elif IS_LINUX and shutil.which("systemctl"):
+        run(["systemctl", "--user", "restart", "cczh"], check=False)
+    else:
+        stop()
+        time.sleep(0.5)
+        _spawn_detached()
+    if _wait_health():
+        say("已重启")
+    else:
+        say("重启后健康检查未通过，查看: cczh logs")
+
 
 def status():
-    loaded = run(["launchctl", "print", f"gui/{UID_}/{LABEL}"],
-                 check=False, quiet=True).returncode == 0
-    say(f"launchd: {'已加载' if loaded else '未加载'}   端口 {PORT}: "
-        f"{'在线' if daemon_up() else '离线'}")
+    if IS_MAC:
+        loaded = run(["launchctl", "print", f"gui/{UID_}/{LABEL}"],
+                     check=False, quiet=True).returncode == 0
+        svc = f"launchd: {'已加载' if loaded else '未加载'}"
+    elif IS_LINUX and shutil.which("systemctl"):
+        r = run(["systemctl", "--user", "is-active", "cczh"],
+                check=False, quiet=True)
+        svc = f"systemd: {r.stdout.strip() or 'unknown'}"
+    else:
+        svc = f"进程: {'运行中' if _pid_alive() else '未运行'}"
+    say(f"{svc}   端口 {PORT}: {'在线' if daemon_up() else '离线'}")
     if daemon_up():
         s = http_json("/stats")
         n = max(s["translated"], 1)
@@ -414,13 +568,19 @@ def selftest(live=False):
     say("全部通过 ✓" if ok else "存在失败项 ✗")
     return ok
 
+def _tail(path, n=30):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-n:]).rstrip()
+    except OSError:
+        return ""
+
+
 def logs():
     for p in (LOG_ERR, LOG_OUT):
         if os.path.exists(p):
             say(f"──── {p} ────")
-            r = run(["tail", "-n", "30", p], check=False)
-            if r.stdout:
-                say(r.stdout.rstrip())
+            say(_tail(p))
 
 # ---------------------------------------------------------------- 会话补翻
 
@@ -540,7 +700,9 @@ def main():
     elif cmd == "logs":
         logs()
     elif cmd == "serve":
-        os.execv(sys.executable, [sys.executable, os.path.join(ROOT, "server.py")])
+        sys.path.insert(0, ROOT)
+        import server
+        server.serve()
     else:
         say(__doc__)
 

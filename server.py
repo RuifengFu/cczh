@@ -465,6 +465,13 @@ class Handler(BaseHTTPRequestHandler):
 def serve():
     if not API_KEY:
         log("警告: 未配置 API key (CCZH_API_KEY / DEEPSEEK_API_KEY)")
+    try:                                             # Windows/手动模式用 pid 文件管理进程
+        pid_dir = os.path.dirname(os.path.expanduser("~/.config/cczh/."))
+        os.makedirs(pid_dir, exist_ok=True)
+        with open(os.path.expanduser("~/.config/cczh/cczh.pid"), "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
     httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     log(f"listening on 127.0.0.1:{PORT} model={MODEL}")
     try:

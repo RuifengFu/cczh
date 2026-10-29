@@ -47,7 +47,7 @@ Claude 的英文回复（流式，按批）
 
 ## 安装
 
-前提：macOS + Python 3（仅标准库）+ Claude Code + 一个翻译 API key。
+前提：macOS / Linux / Windows + Python 3（仅标准库）+ Claude Code + 一个翻译 API key。
 
 ```bash
 git clone https://github.com/RuifengFu/cczh ~/project/cczh && cd ~/project/cczh
@@ -130,6 +130,19 @@ cczh uninstall   # 撤销全部改动（只删自己的钩子，别人的配置�
 - 正文（含 thinking）用英文——这是省 token 的核心开关
 - 例外 1：`/btw` 旁路提问直接用中文（浮层不走 MessageDisplay，翻译不到，只能让模型源头说中文）
 - 例外 2：用户明确要中文产出时（写中文文案、翻译成中文）该部分用中文
+
+## 平台支持
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| 自启方式 | launchd | systemd 用户服务 | 任务计划程序（登录时） |
+| 崩溃自动拉起 | ✓ | ✓ | ✗（崩溃后 `cczh start` 手动拉起） |
+| 命令入口 | `~/.local/bin/cczh` | 同左（确认在 PATH 里） | `%LOCALAPPDATA%\Microsoft\WindowsApps\cczh.cmd` |
+| 日志位置 | `~/Library/Logs/cczh.log` | `~/.local/state/cczh/` | `%LOCALAPPDATA%\cczh\` |
+
+- **Linux**：需要 systemd（绝大多数发行版都有）；纯无桌面/SSH 场景先执行 `loginctl enable-linger $USER`，用户服务才能在非登录会话下常驻。无 systemd 的环境自动降级为手动模式（`cczh start/stop`）。
+- **Windows**：需要已安装 Python 并在 PATH（python.org 安装包勾选 Add to PATH 即可）；在 cmd / PowerShell / Windows Terminal 里使用 `cczh`。钩子本身是 HTTP 调用，与 Claude Code 的 Git Bash/PowerShell 设置无关。
+- 没有系统服务管理器的环境统一走手动模式，行为一致。
 
 ## 已知限制
 
