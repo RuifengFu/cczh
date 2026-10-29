@@ -74,7 +74,7 @@ git clone https://github.com/RuifengFu/cczh ~/project/cczh && cd ~/project/cczh
   "api_key": "sk-...",
   "base_url": "https://api.deepseek.com",
   "model": "deepseek-flash",
-  "effort": "low",
+  "thinking": "off",
   "port": 8795
 }
 ```
@@ -84,7 +84,7 @@ git clone https://github.com/RuifengFu/cczh ~/project/cczh && cd ~/project/cczh
 | `api_key` | 翻译服务的钥匙 | 无（必填） |
 | `base_url` | OpenAI 兼容端点地址 | `https://api.deepseek.com` |
 | `model` | 翻译模型 | `deepseek-flash`（快、便宜，翻译够用） |
-| `effort` | 模型档位（`low`/`high`/`max`，仅部分模型支持） | `low` |
+| `thinking` | `"off"` 彻底关闭推理（翻译不需要；实测省掉每次 300+ 字符的隐藏思考，延迟约 -30%）。改成 `"on"` 后可用 `effort` 字段调档位 | `off` |
 | `port` | 本地服务端口 | `8795` |
 
 改完执行 `cczh restart` 生效。环境变量 `CCZH_API_KEY` / `CCZH_BASE_URL` / `CCZH_MODEL` / `CCZH_PORT` 可临时覆盖（优先级最高）。旧版 `env` 键值文件会在 `cczh install` 时自动迁移成 `config.json`。

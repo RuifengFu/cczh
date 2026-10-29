@@ -64,7 +64,8 @@ def _pick(*names, default=None):
 API_KEY  = _pick("CCZH_API_KEY", "DEEPSEEK_API_KEY", default="")
 BASE_URL = _pick("CCZH_BASE_URL", default="https://api.deepseek.com")
 MODEL    = _pick("CCZH_MODEL", default="deepseek-flash")
-EFFORT   = _pick("CCZH_EFFORT", default="")          # flash 档位: low/high/max
+EFFORT   = _pick("CCZH_EFFORT", default="")          # 档位: low/high/max（thinking 开着时才有意义）
+THINKING = _pick("CCZH_THINKING", default="off")     # 翻译不需要思考: off=彻底关闭
 PORT     = int(_pick("CCZH_PORT", default="8795"))
 TAIL_CHARS  = 280    # 送给译者的上下文长度
 CHUNK_CHARS = 2000   # 超长批次按行边界切块
@@ -186,7 +187,10 @@ class DeepSeek:
                 {"role": "user", "content": user_text},
             ],
         }
-        if EFFORT:                                   # 翻译用低档位：更快更省
+        if THINKING == "off":                        # 翻译不需要推理：两种方言都发，彻底关掉
+            payload["thinking"] = {"type": "disabled"}
+            payload["reasoning_effort"] = "none"
+        elif EFFORT:
             payload["effort"] = EFFORT
         body = json.dumps(payload).encode("utf-8")
 

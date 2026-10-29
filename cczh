@@ -169,8 +169,8 @@ def backend(name):
             say("✗ 没找到 DEEPSEEK_API_KEY（zshrc / 环境变量 / 配置文件都没有）")
             sys.exit(1)
         _config_write({"api_key": key, "base_url": "https://api.deepseek.com",
-                       "model": "deepseek-flash", "effort": "low"})
-        say("✓ 后端切换为 DeepSeek (deepseek-flash, effort=low)")
+                       "model": "deepseek-flash", "thinking": "off"})
+        say("✓ 后端切换为 DeepSeek (deepseek-flash, thinking=off)")
         if os.path.exists(CONFIG_FILE):
             restart()
             time.sleep(0.5)
@@ -189,7 +189,7 @@ def install_config():
     _config_write({"api_key": key,
                    "base_url": data.get("base_url") or "https://api.deepseek.com",
                    "model": data.get("model") or "deepseek-flash",
-                   "effort": data.get("effort") or "low"})
+                   "thinking": data.get("thinking") or "off"})
     say(f"✓ 配置已写入 {CONFIG_FILE}")
     return True
 
